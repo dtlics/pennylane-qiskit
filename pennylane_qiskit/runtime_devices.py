@@ -18,10 +18,47 @@ This module contains classes for constructing Qiskit runtime devices for PennyLa
 
 import numpy as np
 
-from qiskit_ibm_runtime import QiskitRuntimeService
+from qiskit_ibm_runtime import QiskitRuntimeService, Estimator
 from qiskit_ibm_runtime.constants import RunnerResult
 from pennylane_qiskit.ibmq import IBMQDevice
 
+import pennylane as qml
+from qiskit.quantum_info import SparsePauliOp
+from pennylane.ops.qubit.hamiltonian import Hamiltonian
+from qiskit import QuantumCircuit
+
+def get_tape_without_multiRZ(tape):
+
+    ops = tape.expand().operations
+    new_ops = []
+
+    for op in ops:
+        if op.name == 'PauliRot':
+            ps = []
+            for p in op.decomposition():
+                if p.name != 'MultiRZ':
+                    ps.append(p)
+                else:
+                    ps.extend(p.decomposition())
+            new_ops.extend(ps)
+        elif op.name == 'MultiRZ':
+            new_ops.extend(op.decomposition())
+        else:
+            new_ops.append(op)
+    
+    new_tape = qml.tape.QuantumTape(
+        ops=new_ops,
+        measurements=tape.measurements,
+    )
+
+    return new_tape
+
+def convert_to_qiskit_circuit(tape):
+    # if tape is a quantumscript
+    tape_without_multiRZ = get_tape_without_multiRZ(tape)
+    qasm = tape_without_multiRZ.to_openqasm()
+    qiskit_circuit = QuantumCircuit.from_qasm_str(qasm)
+    return qiskit_circuit
 
 class IBMQCircuitRunnerDevice(IBMQDevice):
     r"""Class for a Qiskit runtime circuit-runner program device in PennyLane. Circuit runner is a
@@ -59,7 +96,10 @@ class IBMQCircuitRunnerDevice(IBMQDevice):
         self.runtime_service = QiskitRuntimeService(channel="ibm_quantum")
 
     def batch_execute(self, circuits):
-        compiled_circuits = self.compile_circuits(circuits)
+
+        # compiled_circuits = self.compile_circuits(circuits)
+        compiled_circuits = [convert_to_qiskit_circuit(circuit) for circuit in circuits] # not compiled, directly to qiskit, rely on runtime to transpile, since we have transpile options available
+        # list[QuantumCircuit]: the list of compiled circuits
 
         program_inputs = {"circuits": compiled_circuits, "shots": self.shots}
 
@@ -70,23 +110,81 @@ class IBMQCircuitRunnerDevice(IBMQDevice):
         options = {"backend": self.backend.name, "job_tags": self.kwargs.get("job_tags")}
 
         session_id = self.kwargs.get("session_id")
+        session = self.kwargs.get("_session")
 
         # Send circuits to the cloud for execution by the circuit-runner program.
-        job = self.runtime_service.run(
-            program_id="circuit-runner",
-            options=options,
-            inputs=program_inputs,
-            session_id=session_id,
+        estimator = Estimator(session=session)
+        # we need to measure all qubits in the z basis, ZIII..., IZII..., etc
+        # we generate the set of observables given the number of qubits in the circuit
+        # for each II...Z...III, we generate the observable by SparsePauliOp.from_list([("II...Z...III", 1)])
+        
+        circuits_to_be_run = []
+        observables_to_be_measured = []
+        for (circuit, compiled_circuit) in zip(circuits, compiled_circuits):
+            num_qubits = circuit.num_wires
+            obs = None # [expval(PauliZ(wires=[0]))]
+            # Observables
+            first_observable = circuit.observables[0]
+            if isinstance(first_observable, Hamiltonian):
+                obs = circuit.observables[0]
+            else:
+                obs = qml.Hamiltonian(
+                    [1],
+                    [first_observable],
+                    simplify=True,
+                    grouping_type="qwc",
+                )
+            
+            # now obs is a hamiltonian
+            # we convert the hamiltonian to a SparsePauliOp
+            sparse_op_generators = []
+            alphas, observable_generators = obs.terms()
+            for alpha, observable in zip(alphas, observable_generators):
+                wires = observable.wires
+                pauli_string = qml.pauli.pauli_word_to_string(observable)
+                # total_pauli_string, at the wires, we replace the char, otherwise I
+                total_pauli_string = ''.join(['I' if i not in wires else pauli_string[wires.index(i)] for i in range(num_qubits)])
+                sparse_op_generators.append((total_pauli_string, alpha))
+            observables_to_be_measured.append(SparsePauliOp.from_list(sparse_op_generators))
+            circuits_to_be_run.append(compiled_circuit)
+
+
+
+        job = estimator.run(
+            circuits=circuits_to_be_run, # modified compile process so that compiled_circuits do not have measurements
+            observables=observables_to_be_measured,
+            # parameter_values included in the circuits
+            # all following arguments are kwargs
+            # backend not needed since we have session
+            job_tags=self.kwargs.get("job_tags"),
         )
-        self._current_job = job.result(decoder=RunnerResult)
+        self._current_job = job.result()
+        # job = self.runtime_service.run(
+        #     program_id="circuit-runner",
+        #     options=options,
+        #     inputs=program_inputs,
+        #     session_id=session_id,
+        # )
+        # self._current_job = job.result(decoder=RunnerResult)
 
         results = []
 
+        current = 0
         for index, circuit in enumerate(circuits):
-            self._samples = self.generate_samples(index)
-            res = self.statistics(circuit)
-            single_measurement = len(circuit.measurements) == 1
-            res = res[0] if single_measurement else tuple(res)
+            # self._samples = self.generate_samples(index)
+            # res = self.statistics(circuit)
+            # Union[float, List[float]]: the corresponding statistics
+            values = self._current_job.values
+            # array([1.561 , 0.0705, ...])
+            num_measurements = len(circuit.measurements)
+            # values are a flat list, we need to group them by each's number of measurements
+            # for example, if we have 3 mesuremtns, then the next three values are for this circuit
+
+            res = []
+            for i in range(num_measurements):
+                res.append(values[current + i])
+            current += num_measurements
+            res = res[0] if len(res) == 1 else tuple(res)
             results.append(res)
 
         if self.tracker.active:

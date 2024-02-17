@@ -288,8 +288,9 @@ class QiskitDevice(QubitDevice, abc.ABC):
 
         if not self._is_state_backend:
             # Add measurements if they are needed
-            for qr, cr in zip(self._reg, self._creg):
-                self._circuit.measure(qr, cr)
+            # for qr, cr in zip(self._reg, self._creg):
+            #     self._circuit.measure(qr, cr)
+            pass
         elif "aer" in self.backend_name:
             self._circuit.save_state()
 
